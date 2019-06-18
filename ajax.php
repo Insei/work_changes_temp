@@ -1,4 +1,4 @@
-<?php
+                                                                                                        <?php
 define('NO_KEEP_STATISTIC', 'Y');
 define('NO_AGENT_STATISTIC','Y');
 define('NO_AGENT_CHECK', true);
@@ -147,9 +147,9 @@ elseif($action === 'MOVE_TO_CATEGORY')
 elseif($action === 'SAVE')
 {
 	$ID = isset($_POST['ACTION_ENTITY_ID']) ? max((int)$_POST['ACTION_ENTITY_ID'], 0) : 0;
-
 	$params = isset($_POST['PARAMS']) && is_array($_POST['PARAMS']) ? $_POST['PARAMS'] : array();
 	$categoryID =  isset($params['CATEGORY_ID']) ? (int)$params['CATEGORY_ID'] : 0;
+	$sourceEntityID =  isset($params['DEAL_ID']) ? (int)$params['DEAL_ID'] : 0;
 
 	if(($ID > 0 && !\CCrmDeal::CheckUpdatePermission($ID, $currentUserPermissions))
 		|| ($ID === 0 && !\CCrmDeal::CheckCreatePermission($currentUserPermissions, $categoryID))
@@ -157,10 +157,6 @@ elseif($action === 'SAVE')
 	{
 		__CrmDealDetailsEndJsonResonse(array('ERROR'=>'PERMISSION DENIED!'));
 	}
-
-	$sourceEntityID =  isset($params['DEAL_ID']) ? (int)$params['DEAL_ID'] : 0;
-	$enableRequiredUserFieldCheck = !isset($_POST['ENABLE_REQUIRED_USER_FIELD_CHECK'])
-		|| strtoupper($_POST['ENABLE_REQUIRED_USER_FIELD_CHECK']) === 'Y';
 
 	$isNew = $ID === 0;
 	$isCopyMode = $isNew && $sourceEntityID > 0;
@@ -250,16 +246,6 @@ elseif($action === 'SAVE')
 				);
 			}
 			$companyID = $companyEntity->Add($companyFields, true, array('DISABLE_USER_FIELD_CHECK' => true));
-			if($companyID > 0)
-			{
-				$arErrors = array();
-				\CCrmBizProcHelper::AutoStartWorkflows(
-					\CCrmOwnerType::Company,
-					$companyID,
-					\CCrmBizProcEventType::Create,
-					$arErrors
-				);
-			}
 		}
 
 		$fields['COMPANY_ID'] = $companyID;
@@ -286,7 +272,6 @@ elseif($action === 'SAVE')
 	{
 		$contactIDs = array();
 		$contactData = $clientData['CONTACT_DATA'];
-		$defaultContactName = \CCrmContact::GetDefaultName();
 		foreach($contactData as $contactItem)
 		{
 			$contactID = isset($contactItem['id']) ? (int)$contactItem['id'] : 0;
@@ -294,19 +279,12 @@ elseif($action === 'SAVE')
 			if($contactID <= 0 && $contactTitle !== '' && $enableContactCreation)
 			{
 				$contactFields = array();
-				if($contactTitle === $defaultContactName)
-				{
-					$contactFields['NAME'] = $contactTitle;
-				}
-				else
-				{
-					\Bitrix\Crm\Format\PersonNameFormatter::tryParseName(
-						$contactTitle,
-						\Bitrix\Crm\Format\PersonNameFormatter::getFormatID(),
-						$contactFields
-					);
-				}
-				
+				\Bitrix\Crm\Format\PersonNameFormatter::tryParseName(
+					$contactTitle,
+					\Bitrix\Crm\Format\PersonNameFormatter::getFormatID(),
+					$contactFields
+				);
+
 				$multifieldData =  isset($contactItem['multifields']) && is_array($contactItem['multifields'])
 					? $contactItem['multifields']  : array();
 
@@ -325,14 +303,6 @@ elseif($action === 'SAVE')
 						$bindContactIDs = array();
 					}
 					$bindContactIDs[] = $contactID;
-
-					$arErrors = array();
-					\CCrmBizProcHelper::AutoStartWorkflows(
-						\CCrmOwnerType::Contact,
-						$contactID,
-						\CCrmBizProcEventType::Create,
-						$arErrors
-					);
 				}
 			}
 
@@ -455,8 +425,12 @@ elseif($action === 'SAVE')
 	if (
 		(
 			$_POST['IS_RECURRING'] === 'N'
-			&& isset($_POST['RECURRING']['MODE'])
-			&& $_POST['RECURRING']['MODE'] !== Recurring\Calculator::SALE_TYPE_NON_ACTIVE_DATE
+			&&
+			(
+				($_POST['RECURRING']['PERIOD_DEAL'] != Recurring\Calculator::SALE_TYPE_NON_ACTIVE_DATE
+				&& (int)$_POST['RECURRING']['EXECUTION_TYPE'] === Recurring\Manager::MULTIPLY_EXECUTION)
+				|| (int)$_POST['RECURRING']['EXECUTION_TYPE'] !== Recurring\Manager::MULTIPLY_EXECUTION
+			)
 		)
 		|| ($_POST['IS_RECURRING'] === 'Y')
 	)
@@ -474,6 +448,50 @@ elseif($action === 'SAVE')
 		$limit = Recurring\Entity\Deal::NO_LIMITED;
 		$limitDate = null;
 
+		$recurringRow = Recurring\Manager::getList(
+			array(
+				'filter' => array("=DEAL_ID" => $ID),
+				'select' => array('ID')
+			),
+			Recurring\Manager::DEAL
+		);
+		$recurring = $recurringRow->fetch();
+
+		if ($_POST['RECURRING']['REPEAT_TILL'] === Recurring\Entity\Deal::LIMITED_BY_TIMES && (int)$fields['RECURRING']['LIMIT_REPEAT'] > 0)
+		{
+			$limit = Recurring\Entity\Deal::LIMITED_BY_TIMES;
+		}
+		elseif(
+			$_POST['RECURRING']['REPEAT_TILL'] === Recurring\Entity\Deal::LIMITED_BY_DATE
+			&& strlen($_POST['RECURRING']['END_DATE']) > 0
+		)
+		{
+			$limitDate = new \Bitrix\Main\Type\Date($_POST['RECURRING']['END_DATE']);
+			$limit = Recurring\Entity\Deal::LIMITED_BY_DATE;
+		}
+
+		if (
+			strlen($_POST['RECURRING']['DEAL_DATEPICKER_BEFORE']) > 0
+			&& (int)$_POST['RECURRING']['EXECUTION_TYPE'] === Recurring\Manager::SINGLE_EXECUTION
+		)
+		{
+			$startDate = new \Bitrix\Main\Type\Date($_POST['RECURRING']['DEAL_DATEPICKER_BEFORE']);
+			$limit = Recurring\Entity\Deal::LIMITED_BY_DATE;
+			$limitDateBefore = Recurring\Calculator::getNextDate($_POST['RECURRING'] ,clone($startDate));
+
+			if (
+				($limitDate instanceof \Bitrix\Main\Type\Date && $limitDateBefore->getTimestamp() < $limitDate->getTimestamp())
+				|| empty($limitDate)
+			)
+			{
+				$limitDate = $limitDateBefore;
+			}
+		}
+		else
+		{
+			$startDate = new \Bitrix\Main\Type\Date();
+		}
+
 		$categoryId = 0;
 		if (isset($fields['RECURRING']['CATEGORY_ID']))
 		{
@@ -485,105 +503,17 @@ elseif($action === 'SAVE')
 		}
 		$categoryId = max($categoryId, 0);
 
-		if (
-			$fields['RECURRING']['MODE'] === Recurring\Calculator::SALE_TYPE_NON_ACTIVE_DATE
-			|| (
-				(int)$fields['RECURRING']['MODE'] === Recurring\Manager::MULTIPLY_EXECUTION
-				&& (int)$fields['RECURRING']['MULTIPLE_TYPE'] === Recurring\Calculator::SALE_TYPE_CUSTOM_OFFSET
-				&& (int)$fields['RECURRING']['MULTIPLE_CUSTOM_INTERVAL_VALUE'] <= 0
-			)
-		)
-		{
-			$recurringFields = array(
-				"ACTIVE" => "N",
-				"NEXT_EXECUTION" => null,
-				"PARAMS" => $fields['RECURRING']
-			);
-		}
-		else
-		{
-			$today = new \Bitrix\Main\Type\Date();
-			$startDate = null;
-			$recurringFields = [
-				"CATEGORY_ID" => $categoryId,
-				"PARAMS" => $fields['RECURRING']
-			];
-			if ((int)$fields['RECURRING']['MODE'] === Recurring\Manager::SINGLE_EXECUTION)
-			{
-				$period = $fields['RECURRING']['SINGLE_TYPE'];
-				$limitParams = ['PERIOD' => $period];
-				switch($period)
-				{
-					case Recurring\Calculator::SALE_TYPE_DAY_OFFSET:
-					{
-						$limitParams['TYPE'] = Recurring\DateType\Day::TYPE_A_FEW_DAYS_BEFORE;
-						$limitParams['INTERVAL_DAY'] = (int)$fields['RECURRING']['SINGLE_INTERVAL_VALUE'];
-						break;
-					}
-					case Recurring\Calculator::SALE_TYPE_WEEK_OFFSET:
-					{
-						$limitParams['TYPE'] = Recurring\DateType\Week::TYPE_A_FEW_WEEKS_BEFORE;
-						$limitParams['INTERVAL_WEEK'] = (int)$fields['RECURRING']['SINGLE_INTERVAL_VALUE'];
-						break;
-					}
-					case Recurring\Calculator::SALE_TYPE_MONTH_OFFSET:
-					{
-						$limitParams['TYPE'] = Recurring\DateType\Month::TYPE_A_FEW_MONTHS_BEFORE;
-						$limitParams['INTERVAL_MONTH'] = (int)$fields['RECURRING']['SINGLE_INTERVAL_VALUE'];
-						break;
-					}
-				}
-				$startDateValue = null;
-				if (CheckDateTime($_POST['RECURRING']['SINGLE_DATE_BEFORE']))
-				{
-					$startDateValue = $fields['RECURRING']['SINGLE_DATE_BEFORE'];
-				}
-				$startDate = new \Bitrix\Main\Type\Date($startDateValue);
-				$recurringFields["START_DATE"] = $startDate;
-				$recurringFields["IS_LIMIT"] = Recurring\Entity\Deal::LIMITED_BY_DATE;
-				$recurringFields["LIMIT_DATE"] = Recurring\Calculator::getNextDate($limitParams, clone($startDate));
-			}
-			elseif ((int)$_POST['RECURRING']['MODE'] === Recurring\Manager::MULTIPLY_EXECUTION)
-			{
-				$startDateValue = null;
-				if (CheckDateTime($_POST['RECURRING']['MULTIPLE_DATE_START']))
-				{
-					$startDateValue = $_POST['RECURRING']['MULTIPLE_DATE_START'];
-				}
-				$startDate = new \Bitrix\Main\Type\Date($startDateValue);
-				$recurringFields["START_DATE"] = $startDate;
-				$recurringFields["IS_LIMIT"] = Recurring\Entity\Base::NO_LIMITED;
-				if ($_POST['RECURRING']['MULTIPLE_TYPE_LIMIT'] === Recurring\Entity\Base::LIMITED_BY_TIMES)
-				{
-					$recurringFields["IS_LIMIT"] = Recurring\Entity\Base::LIMITED_BY_TIMES;
-					$recurringFields["LIMIT_REPEAT"] = (int)$_POST['RECURRING']['MULTIPLE_TIMES_LIMIT'];
-				}
-				elseif ($_POST['RECURRING']['MULTIPLE_TYPE_LIMIT'] === Recurring\Entity\Base::LIMITED_BY_DATE)
-				{
-					$recurringFields["IS_LIMIT"] = Recurring\Entity\Base::LIMITED_BY_DATE;
-					$recurringFields["LIMIT_DATE"] = new \Bitrix\Main\Type\Date($_POST['RECURRING']['MULTIPLE_DATE_LIMIT']);
-				}
-			}
-
-			$today = new Main\Type\Date();
-			$nextDate = Recurring\Entity\Deal::getNextDate($fields['RECURRING'], clone($startDate));
-			if ($nextDate->getTimestamp() < $today->getTimestamp())
-			{
-				__CrmDealDetailsEndJsonResonse(array('ERROR' => GetMessage('CRM_DEAL_RECURRING_DATE_START_ERROR')));
-			}
-		}
-
 		// RECURRING_SWITCHER is used for old deal edit template
 		$fields['RECURRING']['RECURRING_SWITCHER'] = 'Y';
-
-		$recurringRow = Recurring\Manager::getList(
-			array(
-				'filter' => array("=DEAL_ID" => $ID),
-				'select' => array('ID')
-			),
-			Recurring\Manager::DEAL
+		$recurringFields = array(
+			"START_DATE" => $startDate,
+			"LIMIT_DATE" => $limitDate,
+			"LIMIT_REPEAT" => $fields['RECURRING']['LIMIT_REPEAT'],
+			"IS_LIMIT" => $limit,
+			"CATEGORY_ID" => $categoryId,
+			"PARAMS" => $fields['RECURRING']
 		);
-		$recurring = $recurringRow->fetch();
+
 		if (is_array($recurring) && !$isNew)
 		{
 			Recurring\Manager::update($recurring['ID'],$recurringFields,Recurring\Manager::DEAL);
@@ -688,9 +618,6 @@ elseif($action === 'SAVE')
 		$conversionWizard->prepareDataForSave(CCrmOwnerType::Deal, $fields);
 	}
 
-	$checkExceptions = null;
-	$errorMessage = '';
-
 	if(!empty($fields) || $enableProductRows || $requisiteID > 0)
 	{
 		if (!empty($fields) && !isset($isRecurringSaving))
@@ -753,16 +680,10 @@ elseif($action === 'SAVE')
 
 				$fields['EXCH_RATE'] = CCrmCurrency::GetExchangeRate($fields['CURRENCY_ID']);
 
-				$options = array('REGISTER_SONET_EVENT' => true);
-				if(!$enableRequiredUserFieldCheck)
+				$ID = $entity->Add($fields, true, array('REGISTER_SONET_EVENT' => true));
+				if ($ID <= 0)
 				{
-					$options['DISABLE_REQUIRED_USER_FIELD_CHECK'] = true;
-				}
-				$ID = $entity->Add($fields, true, $options);
-				if($ID <= 0)
-				{
-					$checkExceptions = $entity->GetCheckExceptions();
-					$errorMessage = $entity->LAST_ERROR;
+					__CrmDealDetailsEndJsonResonse(array('ERROR' => $entity->LAST_ERROR));
 				}
 			}
 			else
@@ -801,47 +722,16 @@ elseif($action === 'SAVE')
 				}
 
 				$options = array('REGISTER_SONET_EVENT' => true);
-				if(!$enableRequiredUserFieldCheck)
-				{
-					$options['DISABLE_REQUIRED_USER_FIELD_CHECK'] = true;
-				}
-				if($isRecurringSaving || $previousFields['IS_RECURRING'] === 'Y')
+				if ($isRecurringSaving || $previousFields['IS_RECURRING'] === 'Y')
 				{
 					$options['REGISTER_STATISTICS'] = false;
 				}
 
-				if(!$entity->Update($ID, $fields, true, true, $options))
+				if (!$entity->Update($ID, $fields, true, true, $options))
 				{
-					$checkExceptions = $entity->GetCheckExceptions();
-					$errorMessage = $entity->LAST_ERROR;
+					__CrmDealDetailsEndJsonResonse(array('ERROR' => $entity->LAST_ERROR));
 				}
 			}
-		}
-
-		if(!empty($checkExceptions) || $errorMessage)
-		{
-			$responseData = array();
-			if(!empty($checkExceptions))
-			{
-				$checkErrors = array();
-				foreach($checkExceptions as $exception)
-				{
-					if($exception instanceof \CAdminException)
-					{
-						foreach($exception->GetMessages() as $message)
-						{
-							$checkErrors[$message['id']] = $message['text'];
-						}
-					}
-				}
-				$responseData['CHECK_ERRORS'] = $checkErrors;
-			}
-
-			if($errorMessage !== '')
-			{
-				$responseData['ERROR'] = $errorMessage;
-			}
-			__CrmDealDetailsEndJsonResonse($responseData);
 		}
 
 		if(!$isExternal && $enableProductRows && (!$isNew || !empty($productRows)))
@@ -1407,100 +1297,4 @@ elseif($action === 'EXCLUDE')
 
 	\Bitrix\Crm\Exclusion\Store::addFromEntity(CCrmOwnerType::Deal, $ID);
 	__CrmDealDetailsEndJsonResonse(array('ENTITY_ID' => $ID));
-}
-elseif($action === 'PREPARE_EDITOR_HTML')
-{
-	$ID = isset($_POST['ACTION_ENTITY_ID']) ? max((int)$_POST['ACTION_ENTITY_ID'], 0) : 0;
-	$guid = isset($_POST['GUID']) ? $_POST['GUID'] : "deal_{$ID}_custom_editor";
-	$params = isset($_POST['PARAMS']) && is_array($_POST['PARAMS']) ? $_POST['PARAMS'] : array();
-	$context = isset($_POST['CONTEXT']) && is_array($_POST['CONTEXT']) ? $_POST['CONTEXT'] : array();
-	$fieldNames = isset($_POST['FIELDS']) && is_array($_POST['FIELDS']) ? $_POST['FIELDS'] : array();
-	$title = isset($_POST['TITLE']) ? $_POST['TITLE'] : '';
-	$isEmbedded = isset($_POST['IS_EMBEDDED']) && strtoupper($_POST['IS_EMBEDDED']) === 'Y';
-	$enableRequiredUserFieldCheck = !isset($_POST['ENABLE_REQUIRED_USER_FIELD_CHECK'])
-		|| strtoupper($_POST['ENABLE_REQUIRED_USER_FIELD_CHECK']) === 'Y';
-	$enableSearchHistory = !isset($_POST['ENABLE_SEARCH_HISTORY'])
-		|| strtoupper($_POST['ENABLE_SEARCH_HISTORY']) === 'Y';
-
-	CBitrixComponent::includeComponentClass('bitrix:crm.deal.details');
-	$component = new CCrmDealDetailsComponent();
-	$component->initializeParams($params);
-	$component->setEntityID($ID);
-	if($ID > 0)
-	{
-		$component->setCategoryID(\CCrmDeal::GetCategoryID($ID));
-	}
-	elseif(isset($context['PARAMS']) && isset($context['PARAMS']['CATEGORY_ID']))
-	{
-		$component->setCategoryID($context['PARAMS']['CATEGORY_ID']);
-	}
-	$component->enableSearchHistory($enableSearchHistory);
-
-	$fieldMap = array_fill_keys($fieldNames, true);
-	$fieldInfos = $component->prepareFieldInfos();
-	$entityConfigElements = array();
-	foreach ($fieldInfos as $fieldInfo)
-	{
-		if(isset($fieldMap[$fieldInfo['name']]))
-		{
-			$entityConfigElements[] = array('name' => $fieldInfo['name']);
-		}
-	}
-
-	$sectionConfig = array(
-		'name' => 'main',
-		'type' => 'section',
-		'elements' => $entityConfigElements
-	);
-
-	if($title !== '')
-	{
-		$sectionConfig['title'] = $title;
-	}
-	else
-	{
-		$sectionConfig['enableTitle'] = false;
-	}
-
-	$GLOBALS['APPLICATION']->RestartBuffer();
-	Header('Content-Type: text/html; charset='.LANG_CHARSET);
-	$APPLICATION->ShowAjaxHead();
-	$APPLICATION->IncludeComponent(
-		'bitrix:crm.entity.editor',
-		'',
-		array(
-			'GUID' => $guid,
-			'CONFIG_ID' => $component->getDefaultConfigID(),
-			'FORCE_DEFAULT_CONFIG' => true,
-			'ENTITY_CONFIG' => array($sectionConfig),
-			'ENTITY_FIELDS' => $component->prepareFieldInfos(),
-			'ENTITY_DATA' => $component->prepareEntityData(),
-			'ENABLE_REQUIRED_FIELDS_INJECTION' => false,
-			'ENABLE_CONFIGURATION_UPDATE' => false,
-			'ENABLE_SECTION_EDIT' => false,
-			'ENABLE_SECTION_CREATION' => false,
-			'ENABLE_USER_FIELD_CREATION' => false,
-			'ENABLE_MODE_TOGGLE' => false,
-			'ENABLE_TOOL_PANEL' => false,
-			'ENABLE_BOTTOM_PANEL' => false,
-			'ENABLE_PAGE_TITLE_CONTROLS' => false,
-			'ENABLE_REQUIRED_USER_FIELD_CHECK' => $enableRequiredUserFieldCheck,
-			'USER_FIELD_ENTITY_ID' => \CCrmDeal::GetUserFieldEntityID(),
-			'SERVICE_URL' => '/bitrix/components/bitrix/crm.deal.details/ajax.php?'.bitrix_sessid_get(),
-			'CONTEXT_ID' => \CCrmOwnerType::DealName.'_'.$ID,
-			'ENTITY_TYPE_ID' => \CCrmOwnerType::Deal,
-			'ENTITY_ID' => $ID,
-			'READ_ONLY' => false,
-			'INITIAL_MODE' => 'edit',
-			'IS_EMBEDDED' => $isEmbedded,
-			'CONTEXT' => $context
-		)
-	);
-
-	if(!defined('PUBLIC_AJAX_MODE'))
-	{
-		define('PUBLIC_AJAX_MODE', true);
-	}
-	require_once($_SERVER['DOCUMENT_ROOT'].'/bitrix/modules/main/include/epilog_after.php');
-	die();
 }
