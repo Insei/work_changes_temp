@@ -3,6 +3,7 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED!==true)die();
 
 use Bitrix\Main;
 use Bitrix\Main\Localization\Loc;
+use Bitrix\Crm;
 use Bitrix\Crm\Category\DealCategory;
 use Bitrix\Crm\Recurring;
 
@@ -34,6 +35,8 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 	private $entityID = 0;
 	/** @var array|null */
 	private $entityData = null;
+	/** @var array|null */
+	private $entityDataScheme = null;
 	/** @var int */
 	private $categoryID = 0;
 	/** @var array|null */
@@ -100,6 +103,82 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 			}
 		}
 	}
+    public function checkAllowPermission()
+    {
+        // Block deal details by permission rules
+        global $USER;
+        if($this->arResult['ENTITY_ID'] != 0){
+            $userGroups = $USER->GetUserGroupArray();
+            if (!in_array(1,$userGroups)) {
+                $checkAllowPermission = [
+                    "company" => false,
+                    "date_first" => false,
+                    "date_last" => false
+                ];
+                $dbRes = CCrmCompany::GetList(['TITLE' => 'ASC'], ['UF_CRM_1533246305' => $USER->GetID()], ['ID']);
+                while ($arRes = $dbRes->Fetch()) {
+                    $arCompanies[] = $arRes['ID'];
+                }
+
+                $dbRes = CIBlockElement::GetList (
+                    ["SORT" => "ASC"],
+                    ["IBLOCK_ID" => 28, "PROPERTY_UF_USER"=> $USER->GetID(), "PROPERTY_UF_CLIENT" => $arCompanies],
+                    false,
+                    false,
+                    ["ID","PROPERTY_*"]
+                );
+
+                while($arRes = $dbRes->GetNextElement())
+                {
+                    $arFields = $arRes->GetFields();
+                    $ibCompanies[$arFields['PROPERTY_101']] = $arFields;
+                }
+
+                $dbRes = CCrmDeal::GetList(['TITLE' => 'ASC'], ['ID' => $this->arResult['ENTITY_ID']], ['COMPANY_ID', 'DATE_CREATE']);
+
+                while ($arRes = $dbRes->Fetch()) {
+                    $arCurrentDeal = $arRes;
+                }
+
+                if (in_array($arCurrentDeal['COMPANY_ID'], $arCompanies)
+                    || $arCurrentDeal['COMPANY_ID'] == ''
+                    || $arCurrentDeal['COMPANY_ID'] == 0)
+                    $checkAllowPermission['company'] = true;
+
+                if ($ibCompanies[$arCurrentDeal['COMPANY_ID']]['PROPERTY_102'] != '')
+                {
+                    if (strtotime($arCurrentDeal['DATE_CREATE']) >= strtotime($ibCompanies[$arCurrentDeal['COMPANY_ID']]['PROPERTY_102']))
+                    {
+                        $checkAllowPermission['date_first'] = true;
+                    }
+                }
+                else
+                {
+                    $checkAllowPermission['date_first'] = true;
+                }
+
+                if ($ibCompanies[$arCurrentDeal['COMPANY_ID']]['PROPERTY_103'] != '')
+                {
+                    if (strtotime($arCurrentDeal['DATE_CREATE']) <= strtotime($ibCompanies[$arCurrentDeal['COMPANY_ID']]['PROPERTY_103']))
+                    {
+                        $checkAllowPermission['date_last'] = true;
+                    }
+                }
+                else
+                {
+                    $checkAllowPermission['date_last'] = true;
+                }
+
+                foreach ($checkAllowPermission as $allowPermission) {
+                    if (!$allowPermission)
+                    {
+                        echo "Доступ запрещён"; die();
+                    }
+                }
+
+            }
+        }
+    }
 	public function executeComponent()
 	{
 		/** @global \CMain $APPLICATION */
@@ -107,6 +186,9 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 
 		//region Params
 		$this->arResult['ENTITY_ID'] = isset($this->arParams['~ENTITY_ID']) ? (int)$this->arParams['~ENTITY_ID'] : 0;
+
+        $this->checkAllowPermission();
+
 		$extras = isset($this->arParams['~EXTRAS']) && is_array($this->arParams['~EXTRAS'])
 			? $this->arParams['~EXTRAS'] : array();
 
@@ -305,21 +387,6 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 		if($this->leadID > 0)
 		{
 			$this->conversionWizard = \Bitrix\Crm\Conversion\LeadConversionWizard::load($this->leadID);
-			if($this->conversionWizard !== null)
-			{
-				$this->arResult['CONTEXT_PARAMS']['LEAD_ID'] = $this->leadID;
-
-				//TODO: Move code in to wizard
-				$config = $this->conversionWizard->getEntityConfig(CCrmOwnerType::Deal);
-				if($config)
-				{
-					$initData = $config->getInitData();
-					if(is_array($initData) && isset($initData['categoryId']))
-					{
-						$this->arResult['CATEGORY_ID'] = $this->categoryID = (int)$initData['categoryId'];
-					}
-				}
-			}
 		}
 
 		if(isset($this->arResult['QUOTE_ID']) && $this->arResult['QUOTE_ID'] > 0)
@@ -334,12 +401,26 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 		if($this->quoteID > 0)
 		{
 			$this->conversionWizard = \Bitrix\Crm\Conversion\QuoteConversionWizard::load($this->quoteID);
-			if($this->conversionWizard !== null)
+		}
+
+		if($this->conversionWizard !== null)
+		{
+			$conversionContextParams = $this->conversionWizard->prepareEditorContextParams(\CCrmOwnerType::Deal);
+			$this->arResult['CONTEXT_PARAMS'] = array_merge(
+				$this->arResult['CONTEXT_PARAMS'],
+				$conversionContextParams
+			);
+			if(isset($conversionContextParams['CATEGORY_ID']))
 			{
-				$this->arResult['CONTEXT_PARAMS']['QUOTE_ID'] = $this->quoteID;
+				$this->arResult['CATEGORY_ID'] = $this->categoryID = $conversionContextParams['CATEGORY_ID'];
 			}
 		}
 		//endregion
+
+		if(!isset($this->arResult['CONTEXT_PARAMS']['CATEGORY_ID']))
+		{
+			$this->arResult['CONTEXT_PARAMS']['CATEGORY_ID'] = $this->categoryID;
+		}
 
 		//region Permissions check
 		if($this->isCopyMode)
@@ -472,7 +553,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 			}
 			else
 			{
-				$APPLICATION->SetTitle($this->entityData['TITLE']);
+				$APPLICATION->SetTitle(htmlspecialcharsbx($this->entityData['TITLE']));
 			}
 		}
 		elseif(!$this->isEditMode)
@@ -581,7 +662,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 		//region FIELDS
 		$companyID = isset($this->entityData['COMPANY_ID']) ? (int)$this->entityData['COMPANY_ID'] : 0;
 		$primaryEntityTypeName = CCrmOwnerType::CompanyName;
-		if($companyID <= 0 || !empty($contactIDs))
+		if($companyID <= 0 && !empty($contactIDs))
 		{
 			$primaryEntityTypeName = CCrmOwnerType::ContactName;
 		}
@@ -691,23 +772,15 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				"editable" => true
 			),
 			array(
-				"name" => "CLIENT",
-				"title" => Loc::getMessage("CRM_DEAL_FIELD_CLIENT"),
-				"type" => "client",
-				"editable" => true,
-				"data" => array(
-					"map" => array(
-						"primaryEntityType" => "CLIENT_PRIMARY_ENTITY_TYPE",
-						"primaryEntityId" => "CLIENT_PRIMARY_ENTITY_ID",
-						"secondaryEntityType" => "CLIENT_SECONDARY_ENTITY_TYPE",
-						"secondaryEntityIds" => "CLIENT_SECONDARY_ENTITY_IDS",
-						"unboundSecondaryEntityIds" => "CLIENT_UBOUND_SECONDARY_ENTITY_IDS",
-						"boundSecondaryEntityIds" => "CLIENT_BOUND_SECONDARY_ENTITY_IDS",
-					),
+				'name' => 'CLIENT',
+				'title' => Loc::getMessage('CRM_DEAL_FIELD_CLIENT'),
+				'type' => 'client_light',
+				'editable' => true,
+				'data' => array(
+					'map' => array('data' => 'CLIENT_DATA'),
 					'info' => 'CLIENT_INFO',
-					'primaryEntityTypeName' => $primaryEntityTypeName,
-					'secondaryEntityTypeName' => CCrmOwnerType::ContactName,
-					'secondaryEntityLegend' => Loc::getMessage('CRM_DEAL_FIELD_CONTACT_LEGEND'),
+					'lastCompanyInfos' => 'LAST_COMPANY_INFOS',
+					'lastContactInfos' => 'LAST_CONTACT_INFOS',
 					'loaders' => array(
 						'primary' => array(
 							CCrmOwnerType::CompanyName => array(
@@ -1065,6 +1138,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				if (\Bitrix\Crm\Automation\Factory::isAutomationAvailable(CCrmOwnerType::Deal))
 				{
 					Bitrix\Main\Page\Asset::getInstance()->addCss('/bitrix/components/bitrix/crm.automation/templates/.default/style.css');
+					Bitrix\Main\Page\Asset::getInstance()->addCss('/bitrix/components/bitrix/bizproc.automation/templates/.default/style.css');
 					$this->arResult['TABS'][] = array(
 						'id' => 'tab_automation',
 						'name' => Loc::getMessage('CRM_DEAL_TAB_AUTOMATION'),
@@ -1281,6 +1355,15 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 		$this->userFieldInfos = null;
 		$this->prepareEntityUserFieldInfos();
 	}
+	public function prepareEntityDataScheme()
+	{
+		if($this->entityDataScheme === null)
+		{
+			$this->entityDataScheme = \CCrmDeal::GetFieldsInfo();
+			$this->userType->PrepareFieldsInfo($this->entityDataScheme);
+		}
+		return $this->entityDataScheme;
+	}
 	public function prepareEntityUserFields()
 	{
 		if($this->userFields === null)
@@ -1442,17 +1525,11 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				$this->entityData['TYPE_ID'] = current(array_keys($typeList));
 			}
 
-			$externalCompanyID = $this->request->get('company_id');
-			if($externalCompanyID > 0)
-			{
-				$this->entityData['COMPANY_ID'] = $externalCompanyID;
-			}
-
-			$externalContactID = $this->request->get('contact_id');
-			if($externalContactID > 0)
-			{
-				$this->entityData['CONTACT_ID'] = $externalContactID;
-			}
+			\Bitrix\Crm\Entity\EntityEditor::mapRequestData(
+				$this->prepareEntityDataScheme(),
+				$this->entityData,
+				$this->userFields
+			);
 		}
 		else
 		{
@@ -1502,7 +1579,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				ob_start();
 				\CSaleLocation::proxySaleAjaxLocationsComponent(
 					array(
-						'AJAX_CALL' => 'Т',
+						'AJAX_CALL' => 'N',
 						'COUNTRY_INPUT_NAME' => 'LOC_COUNTRY',
 						'REGION_INPUT_NAME' => 'LOC_REGION',
 						'CITY_INPUT_NAME' => 'LOC_CITY',
@@ -1540,6 +1617,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				{
 					$this->entityData['STAGE_ID'] = current(array_keys($stageList));
 				}
+
 			}
 			//endregion
 		}
@@ -1589,13 +1667,23 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 
 			$isEmptyField = true;
 			$fieldParams = $fieldData['data']['fieldInfo'];
-			if((is_string($fieldValue) && $fieldValue !== '')
-				|| (is_array($fieldValue) && !empty($fieldValue))
-			)
-			{
-				$fieldParams['VALUE'] = $fieldValue;
-				$isEmptyField = false;
-			}
+            //SABETS Delete fields from copy
+            $deleteFields = array('UF_PROFIT', 'UF_TITLE_CLIENT','UF_RESPONS_LOGIST','UF_COST_TRANS','UF_OTHER_EXPENSES','UF_DATE_SEND_DOCS',
+                'UF_DATE_SEND_OR_DOCS','UF_CRM_1533196894','UF_BRAND_CAR_SHIP','UF_CAR_NUMBER_SHIP','UF_SEMITRAILER_BRAND',
+                'UF_SEMITRAILER_NUMB','UF_PHONE_DRIVER','UF_FULL_NAME_DRIVER','UF_PASSPORT_DRIVER','UF_PAY_METHOD_SHIP',
+                'UF_SHIP_BANK_DAY','UF_DATE_SEND_DOC_SHI','UF_DT_SEND_OR_DOC_SH','UF_DATE_PAY_CLIENT','UF_ACC_NUMBER_CLIENT',
+                'UF_ACC_DATE_CLIENT','UF_DATE_PAY_SHIP','UF_ACC_NUMBER_SHIP','UF_ACC_DATE_SHIP','UF_PARTIC_DISCOUNT');
+
+            if ( !($this->isCopyMode && in_array($fieldName, $deleteFields) ) ) {
+
+                if((is_string($fieldValue) && $fieldValue !== '')
+                    || (is_array($fieldValue) && !empty($fieldValue))
+                )
+                {
+                    $fieldParams['VALUE'] = $fieldValue;
+                    $isEmptyField = false;
+                }
+            }
 
 			$fieldSignature = $this->userFieldDispatcher->getSignature($fieldParams);
 			if($isEmptyField)
@@ -1614,6 +1702,20 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				);
 			}
 		}
+		//SABETS Delete base fields from copy
+        if ($this->isCopyMode){
+            $this->entityData['STAGE_ID'] = "NEW";
+            $this->entityData['OPPORTUNITY'] = '';
+            $this->entityData['ASSIGNED_BY_ID'] = 0;
+            $this->entityData['COMPANY_ID'] = '';
+            $this->entityData['COMMENT'] = '';
+            $this->entityData['ASSIGNED_BY_LOGIN'] = '';
+            $this->entityData['ASSIGNED_BY_NAME'] = '';
+            $this->entityData['ASSIGNED_BY_SECOND_NAME'] = '';
+            $this->entityData['ASSIGNED_BY_LAST_NAME'] =  '';
+            $this->entityData['ASSIGNED_BY_PERSONAL_PHOTO'] = '';
+//            echo "<pre>", print_r($this->entityData);
+        }
 		//endregion
 		//region Opportunity & Currency
 		$this->entityData['FORMATTED_OPPORTUNITY_WITH_CURRENCY'] = \CCrmCurrency::MoneyToString(
@@ -1691,7 +1793,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				)
 			);
 
-			$clientInfo['PRIMARY_ENTITY_DATA'] = $companyInfo;
+			$clientInfo['COMPANY_DATA'] = $companyInfo;
 		}
 
 		$contactBindings = array();
@@ -1712,7 +1814,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 		}
 
 		$contactIDs = \Bitrix\Crm\Binding\EntityBinding::prepareEntityIDs(\CCrmOwnerType::Contact, $contactBindings);
-		$clientInfo['SECONDARY_ENTITY_DATA'] = array();
+		$clientInfo['CONTACT_DATA'] = array();
 		foreach($contactIDs as $contactID)
 		{
 			$this->prepareMultifieldData(CCrmOwnerType::Contact, $contactID, 'PHONE', $multiFieldData);
@@ -1720,7 +1822,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 			$this->prepareMultifieldData(\CCrmOwnerType::Contact, $contactID, 'IM', $multiFieldData);
 
 			$isEntityReadPermitted = CCrmContact::CheckReadPermission($contactID, $this->userPermissions);
-			$clientInfo['SECONDARY_ENTITY_DATA'][] = CCrmEntitySelectorHelper::PrepareEntityInfo(
+			$clientInfo['CONTACT_DATA'][] = CCrmEntitySelectorHelper::PrepareEntityInfo(
 				CCrmOwnerType::ContactName,
 				$contactID,
 				array(
@@ -1733,11 +1835,23 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				)
 			);
 		}
-		if(!isset($clientInfo['PRIMARY_ENTITY_DATA']) && !empty($clientInfo['SECONDARY_ENTITY_DATA']))
-		{
-			$clientInfo['PRIMARY_ENTITY_DATA'] = array_shift($clientInfo['SECONDARY_ENTITY_DATA']);
-		}
 		$this->entityData['CLIENT_INFO'] = $clientInfo;
+
+		$this->entityData['LAST_COMPANY_INFOS'] = Crm\Controller\Entity::prepareSearchResults(
+			Crm\Controller\Entity::getRecentlyUsedItems(
+				'crm.deal.details',
+				'company',
+				array('EXPAND_ENTITY_TYPE_ID' => CCrmOwnerType::Company)
+			)
+		);
+
+		$this->entityData['LAST_CONTACT_INFOS'] = Crm\Controller\Entity::prepareSearchResults(
+			Crm\Controller\Entity::getRecentlyUsedItems(
+				'crm.deal.details',
+				'contact',
+				array('EXPAND_ENTITY_TYPE_ID' => CCrmOwnerType::Contact)
+			)
+		);
 
 		//region Requisites
 		$this->entityData['REQUISITE_BINDING'] = array();
@@ -1767,6 +1881,14 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 			}
 		}
 
+		$this->entityData['LAST_CONTACT_INFOS'] = Crm\Controller\Entity::prepareSearchResults(
+			Crm\Controller\Entity::getRecentlyUsedItems(
+				'crm.deal.details',
+				'contact',
+				array('EXPAND_ENTITY_TYPE_ID' => CCrmOwnerType::Contact)
+			)
+		);
+
 		$requisiteLinkInfo = $requisite->getDefaultRequisiteInfoLinked($requisiteEntityList);
 		if (is_array($requisiteLinkInfo))
 		{
@@ -1788,7 +1910,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				array('SORT' => 'ASC', 'ID'=>'ASC'),
 				array(
 					'OWNER_ID' => $this->entityID, 'OWNER_TYPE' => 'D'
-			   	),
+				),
 				false,
 				false,
 				array(
@@ -1800,7 +1922,7 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 					'QUANTITY',
 					'TAX_INCLUDED',
 					'TAX_RATE'
-			   )
+				)
 			);
 
 			while($fields = $dbResult->Fetch())
@@ -1911,21 +2033,21 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 				continue;
 			}
 
-			if(!isset($data[$typeID]))
-			{
-				$data[$typeID] = array();
-			}
-
-			if(!isset($data[$typeID][$entityKey]))
-			{
-				$data[$typeID][$entityKey] = array();
-			}
-
 			//Is required for phone & email & messenger menu
 			if($typeID === 'PHONE' || $typeID === 'EMAIL'
-				|| ($typeID === 'IM' && preg_match('/^imol|/', $value) === 1)
+				|| ($typeID === 'IM' && preg_match('/^imol\|/', $value) === 1)
 			)
 			{
+				if(!isset($data[$typeID]))
+				{
+					$data[$typeID] = array();
+				}
+
+				if(!isset($data[$typeID][$entityKey]))
+				{
+					$data[$typeID][$entityKey] = array();
+				}
+
 				$formattedValue = $typeID === 'PHONE'
 					? Main\PhoneNumber\Parser::getInstance()->parse($value)->format()
 					: $value;
@@ -1938,10 +2060,6 @@ class CCrmDealDetailsComponent extends CBitrixComponent
 					'COMPLEX_ID' => $multiFieldComplexID,
 					'COMPLEX_NAME' => \CCrmFieldMulti::GetEntityNameByComplex($multiFieldComplexID, false)
 				);
-			}
-			else
-			{
-				$data[$typeID][$entityKey][] = $value;
 			}
 		}
 	}
