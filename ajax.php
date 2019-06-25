@@ -1,4 +1,3 @@
-<?php
 define('NO_KEEP_STATISTIC', 'Y');
 define('NO_AGENT_STATISTIC','Y');
 define('NO_AGENT_CHECK', true);
@@ -6,11 +5,13 @@ define('DisableEventsCheck', true);
 
 require_once($_SERVER['DOCUMENT_ROOT'].'/bitrix/modules/main/include/prolog_before.php');
 
+use Bitrix\Main;
 use Bitrix\Crm\Security\EntityAuthorization;
 use Bitrix\Crm\Synchronization\UserFieldSynchronizer;
 use Bitrix\Crm\Conversion\DealConversionConfig;
 use Bitrix\Crm\Conversion\DealConversionWizard;
 use Bitrix\Crm\Recurring;
+use Bitrix\Crm;
 
 if (!CModule::IncludeModule('crm'))
 {
@@ -106,14 +107,33 @@ elseif($action === 'MOVE_TO_CATEGORY')
 	$DB->StartTransaction();
 	try
 	{
-		$error = \CCrmDeal::MoveToCategory($ID, $newCategoryID);
+		$recurringData = \Bitrix\Crm\Recurring\Manager::getList(
+			array(
+				'filter' => array('DEAL_ID' => $ID),
+				'limit' => 1
+			),
+			\Bitrix\Crm\Recurring\Manager::DEAL
+		);
+		$options = null;
+		if ($recurringData->fetch())
+			$options = array('REGISTER_STATISTICS' => false);
+
+		$error = \CCrmDeal::MoveToCategory($ID, $newCategoryID, $options);
 		if($error !== \Bitrix\Crm\Category\DealCategoryChangeError::NONE)
 		{
 			__CrmDealDetailsEndJsonResonse(
 				array('ERROR' => GetMessage('CRM_DEAL_MOVE_TO_CATEGORY_ERROR'))
 			);
 		}
+
+		\CCrmBizProcHelper::AutoStartWorkflows(
+			\CCrmOwnerType::Deal,
+			$ID,
+			\CCrmBizProcEventType::Edit,
+			$errors
+		);
 		Bitrix\Crm\Automation\Factory::runOnStatusChanged(CCrmOwnerType::Deal, $ID);
+
 		$DB->Commit();
 	}
 	catch(Exception $e)
@@ -126,16 +146,16 @@ elseif($action === 'MOVE_TO_CATEGORY')
 elseif($action === 'SAVE')
 {
 	$ID = isset($_POST['ACTION_ENTITY_ID']) ? max((int)$_POST['ACTION_ENTITY_ID'], 0) : 0;
-	$categoryID =  isset($_POST['CATEGORY_ID']) ? max((int)$_POST['CATEGORY_ID'], 0) : 0;
+	$params = isset($_POST['PARAMS']) && is_array($_POST['PARAMS']) ? $_POST['PARAMS'] : array();
+	$categoryID =  isset($params['CATEGORY_ID']) ? (int)$params['CATEGORY_ID'] : 0;
+	$sourceEntityID =  isset($params['DEAL_ID']) ? (int)$params['DEAL_ID'] : 0;
+
 	if(($ID > 0 && !\CCrmDeal::CheckUpdatePermission($ID, $currentUserPermissions))
 		|| ($ID === 0 && !\CCrmDeal::CheckCreatePermission($currentUserPermissions, $categoryID))
 	)
 	{
 		__CrmDealDetailsEndJsonResonse(array('ERROR'=>'PERMISSION DENIED!'));
 	}
-
-	$params = isset($_POST['PARAMS']) && is_array($_POST['PARAMS']) ? $_POST['PARAMS'] : array();
-	$sourceEntityID =  isset($params['DEAL_ID']) ? (int)$params['DEAL_ID'] : 0;
 
 	$isNew = $ID === 0;
 	$isCopyMode = $isNew && $sourceEntityID > 0;
@@ -184,56 +204,132 @@ elseif($action === 'SAVE')
 	}
 
 	//region CLIENT
-	$primaryClientTypeName = isset($_POST['CLIENT_PRIMARY_ENTITY_TYPE']) ? $_POST['CLIENT_PRIMARY_ENTITY_TYPE'] : '';
-	$primaryClientTypeID = \CCrmOwnerType::ResolveID($primaryClientTypeName);
-
-	$secondaryClientTypeName = isset($_POST['CLIENT_SECONDARY_ENTITY_TYPE']) ? $_POST['CLIENT_SECONDARY_ENTITY_TYPE'] : '';
-	$secondaryClientTypeID = \CCrmOwnerType::ResolveID($secondaryClientTypeName);
-
-	$primaryClientID = 0;
-
-	$boundSecondaryClientIDs = array();
-	$unboundSecondaryClientIDs = array();
-	if($primaryClientTypeID !== \CCrmOwnerType::Undefined && $secondaryClientTypeID !== \CCrmOwnerType::Undefined)
+	$clientData = null;
+	if(isset($_POST['CLIENT_DATA']) && $_POST['CLIENT_DATA'] !== '')
 	{
-		$companyID = 0;
-		$contactIDs = array();
-
-		$primaryClientID = isset($_POST['CLIENT_PRIMARY_ENTITY_ID']) ? (int)$_POST['CLIENT_PRIMARY_ENTITY_ID'] : 0;
-		if($primaryClientID < 0)
+		try
 		{
-			$primaryClientID = 0;
+			$clientData = Main\Web\Json::decode(
+				Main\Text\Encoding::convertEncoding($_POST['CLIENT_DATA'], LANG_CHARSET, 'UTF-8')
+			);
 		}
-
-		if($primaryClientID > 0)
+		catch (Main\SystemException $e)
 		{
-			if($primaryClientTypeID === \CCrmOwnerType::Company)
+		}
+	}
+
+	if(!is_array($clientData))
+	{
+		$clientData = array();
+	}
+
+	$companyID = 0;
+	$companyEntity = new \CCrmCompany(false);
+	$enableCompanyCreation = \CCrmCompany::CheckCreatePermission($currentUserPermissions);
+	if(isset($clientData['COMPANY_DATA']) && is_array($clientData['COMPANY_DATA']))
+	{
+		$companyData = $clientData['COMPANY_DATA'];
+		$companyID = isset($companyData['id']) ? (int)$companyData['id'] : 0;
+		$companyTitle = isset($companyData['title']) ? trim($companyData['title']) : '';
+		if($companyID <= 0 && $companyTitle !== '' && $enableCompanyCreation)
+		{
+			$companyFields = array('TITLE' => $companyTitle);
+			$multifieldData =  isset($companyData['multifields']) && is_array($companyData['multifields'])
+				? $companyData['multifields']  : array();
+
+			if(!empty($multifieldData))
 			{
-				$companyID = $primaryClientID;
+				\Bitrix\Crm\Component\EntityDetails\BaseComponent::prepareMultifieldsForSave(
+					$multifieldData,
+					$companyFields
+				);
 			}
-			elseif($primaryClientTypeID === \CCrmOwnerType::Contact)
-			{
-				$contactIDs[$primaryClientID] = true;
-			}
+			$companyID = $companyEntity->Add($companyFields, true, array('DISABLE_USER_FIELD_CHECK' => true));
 		}
-
-		$secondaryClientIDs = isset($_POST['CLIENT_SECONDARY_ENTITY_IDS']) ? $_POST['CLIENT_SECONDARY_ENTITY_IDS'] : '';
-		$secondaryClientIDs = $secondaryClientIDs !== '' ? explode(',', $secondaryClientIDs) : array();
-
-		foreach($secondaryClientIDs as $clientID)
-		{
-			$contactIDs[$clientID] = true;
-		}
-		$contactIDs = array_keys($contactIDs);
 
 		$fields['COMPANY_ID'] = $companyID;
+		if($companyID > 0)
+		{
+			Crm\Controller\Entity::addLastRecentlyUsedItems(
+				'crm.deal.details',
+				'company',
+				array(
+					array(
+						'ENTITY_TYPE_ID' => CCrmOwnerType::Company,
+						'ENTITY_ID' => $fields['COMPANY_ID']
+					)
+				)
+			);
+		}
+	}
+
+	$contactIDs = null;
+	$bindContactIDs = null;
+	$contactEntity = new \CCrmContact(false);
+	$enableContactCreation = \CCrmContact::CheckCreatePermission($currentUserPermissions);
+	if(isset($clientData['CONTACT_DATA']) && is_array($clientData['CONTACT_DATA']))
+	{
+		$contactIDs = array();
+		$contactData = $clientData['CONTACT_DATA'];
+		foreach($contactData as $contactItem)
+		{
+			$contactID = isset($contactItem['id']) ? (int)$contactItem['id'] : 0;
+			$contactTitle = isset($contactItem['title']) ? trim($contactItem['title']) : '';
+			if($contactID <= 0 && $contactTitle !== '' && $enableContactCreation)
+			{
+				$contactFields = array();
+				\Bitrix\Crm\Format\PersonNameFormatter::tryParseName(
+					$contactTitle,
+					\Bitrix\Crm\Format\PersonNameFormatter::getFormatID(),
+					$contactFields
+				);
+
+				$multifieldData =  isset($contactItem['multifields']) && is_array($contactItem['multifields'])
+					? $contactItem['multifields']  : array();
+
+				if(!empty($multifieldData))
+				{
+					\Bitrix\Crm\Component\EntityDetails\BaseComponent::prepareMultifieldsForSave(
+						$multifieldData,
+						$contactFields
+					);
+				}
+				$contactID = $contactEntity->Add($contactFields, true, array('DISABLE_USER_FIELD_CHECK' => true));
+				if($contactID > 0)
+				{
+					if(!is_array($bindContactIDs))
+					{
+						$bindContactIDs = array();
+					}
+					$bindContactIDs[] = $contactID;
+				}
+			}
+
+			if($contactID > 0)
+			{
+				$contactIDs[] = $contactID;
+			}
+		}
+
+		if(!empty($contactIDs))
+		{
+			$contactIDs = array_unique($contactIDs);
+		}
+
 		$fields['CONTACT_IDS'] = $contactIDs;
-
-		$s = isset($_POST['CLIENT_UBOUND_SECONDARY_ENTITY_IDS']) ? $_POST['CLIENT_UBOUND_SECONDARY_ENTITY_IDS'] : '';
-		$unboundSecondaryClientIDs = $s !== '' ? explode(',', $s) : array();
-
-		$s = isset($_POST['CLIENT_BOUND_SECONDARY_ENTITY_IDS']) ? $_POST['CLIENT_BOUND_SECONDARY_ENTITY_IDS'] : '';
-		$boundSecondaryClientIDs = $s !== '' ? explode(',', $s) : array();
+		if(!empty($fields['CONTACT_IDS']))
+		{
+			$contactBindings = array();
+			foreach($fields['CONTACT_IDS'] as $contactID)
+			{
+				$contactBindings[] = array('ENTITY_TYPE_ID' => CCrmOwnerType::Contact, 'ENTITY_ID' => $contactID);
+			}
+			Crm\Controller\Entity::addLastRecentlyUsedItems(
+				'crm.deal.details',
+				'contact',
+				$contactBindings
+			);
+		}
 	}
 	//endregion
 
@@ -438,7 +534,37 @@ elseif($action === 'SAVE')
 
 				foreach($userFields as $key => $field)
 				{
-					$dealFields[$key] = $field['VALUE'];
+					if ($field["USER_TYPE"]["BASE_TYPE"] == "file" && !empty($field['VALUE']))
+					{
+						if (is_array($field['VALUE']))
+						{
+							$dealFields[$key] = array();
+							foreach ($field['VALUE'] as $value)
+							{
+								$fileData = \CFile::MakeFileArray($value);
+								if (is_array($fileData))
+								{
+									$dealFields[$key][] = $fileData;
+								}
+							}
+						}
+						else
+						{
+							$fileData = \CFile::MakeFileArray($field['VALUE']);
+							if (is_array($fileData))
+							{
+								$dealFields[$key] = $fileData;
+							}
+							else
+							{
+								$dealFields[$key] = $field['VALUE'];
+							}
+						}
+					}
+					else
+					{
+						$dealFields[$key] = $field['VALUE'];
+					}
 				}
 
 				$isNew = true;
@@ -491,7 +617,7 @@ elseif($action === 'SAVE')
 		$conversionWizard->prepareDataForSave(CCrmOwnerType::Deal, $fields);
 	}
 
-	if(!empty($fields) || $enableProductRows)
+	if(!empty($fields) || $enableProductRows || $requisiteID > 0)
 	{
 		if (!empty($fields) && !isset($isRecurringSaving))
 		{
@@ -594,7 +720,13 @@ elseif($action === 'SAVE')
 					$fields['EXCH_RATE'] = CCrmCurrency::GetExchangeRate($fields['CURRENCY_ID']);
 				}
 
-				if (!$entity->Update($ID, $fields, true, true, array('REGISTER_SONET_EVENT' => true)))
+				$options = array('REGISTER_SONET_EVENT' => true);
+				if ($isRecurringSaving || $previousFields['IS_RECURRING'] === 'Y')
+				{
+					$options['REGISTER_STATISTICS'] = false;
+				}
+
+				if (!$entity->Update($ID, $fields, true, true, $options))
 				{
 					__CrmDealDetailsEndJsonResonse(array('ERROR' => $entity->LAST_ERROR));
 				}
@@ -621,15 +753,56 @@ elseif($action === 'SAVE')
 			\CCrmProductRow::SaveSettings('D', $ID, $productRowSettings);
 		}
 
-		if($primaryClientID > 0 && $primaryClientTypeID === \CCrmOwnerType::Company)
+		$editorSettings = new \Bitrix\Crm\Settings\EntityEditSettings(
+			isset($_POST['EDITOR_CONFIG_ID']) ? $_POST['EDITOR_CONFIG_ID'] : 'deal_details'
+		);
+		if($editorSettings->isClientCompanyEnabled() &&
+			$editorSettings->isClientContactEnabled() &&
+			$companyID > 0 &&
+			is_array($bindContactIDs) &&
+			!empty($bindContactIDs)
+		)
 		{
-			if(!empty($unboundSecondaryClientIDs))
+			\Bitrix\Crm\Binding\ContactCompanyTable::bindContactIDs($companyID, $bindContactIDs);
+		}
+
+		$requisite = new \Bitrix\Crm\EntityRequisite();
+		if($isNew && $requisiteID <= 0)
+		{
+			$requisiteEntityList = array();
+			if(isset($fields['QUOTE_ID']) && $fields['QUOTE_ID'] > 0)
 			{
-				\Bitrix\Crm\Binding\ContactCompanyTable::unbindContactIDs($primaryClientID, $unboundSecondaryClientIDs);
+				$requisiteEntityList[] = array(
+					'ENTITY_TYPE_ID' => CCrmOwnerType::Quote,
+					'ENTITY_ID' => $fields['QUOTE_ ID']
+				);
 			}
-			if(!empty($boundSecondaryClientIDs))
+			if(isset($fields['COMPANY_ID']) && $fields['COMPANY_ID'] > 0)
 			{
-				\Bitrix\Crm\Binding\ContactCompanyTable::bindContactIDs($primaryClientID, $boundSecondaryClientIDs);
+				$requisiteEntityList[] = array(
+					'ENTITY_TYPE_ID' => CCrmOwnerType::Company,
+					'ENTITY_ID' => $fields['COMPANY_ID']
+				);
+			}
+			if(isset($fields['CONTACT_ID']) && $fields['CONTACT_ID'] > 0)
+			{
+				$requisiteEntityList[] = array(
+					'ENTITY_TYPE_ID' => CCrmOwnerType::Contact,
+					'ENTITY_ID' => $fields['CONTACT_ID']
+				);
+			}
+
+			$requisiteInfo = $requisite->getDefaultRequisiteInfoLinked($requisiteEntityList);
+			if(is_array($requisiteInfo))
+			{
+				if(isset($requisiteInfo['REQUISITE_ID']))
+				{
+					$requisiteID = (int)$requisiteInfo['REQUISITE_ID'];
+				}
+				if(isset($requisiteInfo['BANK_DETAIL_ID']))
+				{
+					$bankDetailID = (int)$requisiteInfo['BANK_DETAIL_ID'];
+				}
 			}
 		}
 
@@ -640,13 +813,6 @@ elseif($action === 'SAVE')
 				$ID,
 				$requisiteID,
 				$bankDetailID
-			);
-		}
-		elseif(!$isNew)
-		{
-			\Bitrix\Crm\Requisite\EntityLink::unregister(
-				CCrmOwnerType::Deal,
-				$ID
 			);
 		}
 
@@ -695,18 +861,31 @@ elseif($action === 'SAVE')
 
 	CBitrixComponent::includeComponentClass('bitrix:crm.deal.details');
 	$component = new CCrmDealDetailsComponent();
-	$component->initializeParams(
-		isset($_POST['PARAMS']) && is_array($_POST['PARAMS']) ? $_POST['PARAMS'] : array()
-	);
+	$component->initializeParams($params);
 	$component->setEntityID($ID);
 	$result = array('ENTITY_ID' => $ID, 'ENTITY_DATA' => $component->prepareEntityData());
+
 	if($isNew)
 	{
+		$result['EVENT_PARAMS'] = array(
+			'entityInfo' => \CCrmEntitySelectorHelper::PrepareEntityInfo(
+				CCrmOwnerType::DealName,
+				$ID,
+				array(
+					'ENTITY_EDITOR_FORMAT' => true,
+					'NAME_TEMPLATE' =>
+						isset($params['NAME_TEMPLATE'])
+							? $params['NAME_TEMPLATE']
+							: \Bitrix\Crm\Format\PersonNameFormatter::getFormat()
+				)
+			)
+		);
+
 		$result['REDIRECT_URL'] = \CCrmOwnerType::GetDetailsUrl(
 			\CCrmOwnerType::Deal,
 			$ID,
 			false,
-			array('OPEN_IN_SLIDER' => true)
+			array('ENABLE_SLIDER' => true)
 		);
 	}
 
